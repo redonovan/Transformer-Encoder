@@ -310,19 +310,17 @@ history = model.fit((x_train, tmask),
 # embedding is fed to the individual attention head matrices in the
 # MultiHeadAttention class, but these were initialized (somewhat
 # arbitrarily) using the random normal initializer, so there is no
-# 1/sqrt(model_dim) to compensate for here.  In fact, given their
-# fixed initializations the matrix multiplications will, if anything,
+# obvious 1/sqrt(model_dim) to compensate for here.  In fact, given
+# their fixed initializations the matrix multiplications might even
 # contribute a further sqrt(model_dim) upscaling, reduced by their
-# 0.05 default stdev.  The individual head values are then fed to the
-# keras Attention layer, where the dot product is scaled by an
-# explicit 1/sqrt(head_dim).  Of course, this scaling was introduced
-# in the first place because the dot product operation tends to
-# inflate the scale by this same amount.  Nevertheless, this is the
-# first explicit inverse scaling in my model following the embedding.
-# After MultiHeadAttention comes a LayerNormalization, which sets the
-# scale to 1, so the effect cannot be due to later components.  Is the
-# embedding scale multiple learning to compensate for the initial
-# Attention layer inverse scaling?  I think the answer is no...
+# 0.05 default stdev.  The individual head values are then fed to an
+# Attention layer.  However, an oversight on my part was to use the
+# standard Keras Attention layer, which, unlike the attention layer
+# used in the Transformer paper, does not apply a 1/sqrt(head_dim)
+# inverse scaling to the dot product result.  There is therefore no
+# inverse scaling to compensate for here either.  After the MultiHead-
+# Attention comes a LayerNormalization, which sets the scale to 1, so
+# the learned scale multiplier cannot be due to later components.
 
 # I decided to look at the stdev of the Embedding weights after
 # training and combine that with the learned scale multiple.  In the
