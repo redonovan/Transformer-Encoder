@@ -1,5 +1,5 @@
 # Transformer Encoder, implemented from the Transformer paper, applied to IMDB sentiment analysis.
-# Apr-Aug 2021
+# Apr-Sep 2021 (v6)
 
 
 import numpy as np
@@ -99,6 +99,7 @@ class ScaleLayer(tf.keras.layers.Layer):
 # apply the learnable scale
 epe = ScaleLayer()(e) + pet
 
+
 # Or, as I thought the first time I saw this, put the positional encoding into embedding dimensions
 # of its own so it doesn't corrupt the word embeddings?  That I'll leave for a future experiment.
 
@@ -118,40 +119,46 @@ class MultiHeadAttention(keras.layers.Layer):
     #
     # build is called automatically the first time __call__() is called
     def build(self, input_shape):
-        query_shape, value_shape = input_shape
-        # the last dimension of both the query and value tensors should be the same
-        assert(query_shape[-1] == value_shape[-1])
+        query_shape, value_shape, key_shape = input_shape
+        # the last dimension of the query and key tensors should be the same
+        assert(query_shape[-1] == key_shape[-1])
         # this is the model_dim
         self.model_dim = query_shape[-1]
         # compute the key (and query and value) dimension for each head
-        self.dk        = self.model_dim // self.nheads
-        # create query and value weights for each attention head
+        self.dk  = self.model_dim // self.nheads
+        # create query, value and key weights for each attention head
         self.qwl = []
         self.vwl = []
+        self.kwl = []
         for h in range(self.nheads):
             qw = self.add_weight(shape=(self.model_dim, self.dk), initializer="random_normal", trainable=True)
             vw = self.add_weight(shape=(self.model_dim, self.dk), initializer="random_normal", trainable=True)
+            kw = self.add_weight(shape=(self.model_dim, self.dk), initializer="random_normal", trainable=True)
             self.qwl.append(qw)
             self.vwl.append(vw)
-        # and the output weight matrix applied to the concatenated head vector
+            self.kwl.append(kw)
+        # create the output weight matrix to be applied to the concatenated head vectors
         self.wo = self.add_weight(shape=(self.nheads * self.dk, self.model_dim),
                                   initializer="random_normal",
                                   trainable=True)
     #
     #
-    # lqv should be a list of [query, value] tensors, each of shape (batch, timesteps, model_dim)
-    # keys are assumed to be equal to values (the usual case)
-    # lm should be a list of [query, value] masks where False means a pad
-    def call(self, lqv, lm):
-        query, value = lqv
+    def call(self, inputs, mask):
+        # inputs should be a list of [query, value, key] tensors, each of shape (batch, Tq/Tv, model_dim)
+        query, value, key = inputs
+        # mask should be a list of [query, value] masks where False means a pad, (batch, Tq/Tv)
+        qmask, vmask = mask
         # loop over heads
         hl = []
         for h in range(self.nheads):
-            # use the weight matrices for each head to compute that head's query and value tensors
+            # use the weight matrices for each head to compute that head's query, value and key tensors
             qi = tf.matmul(query, self.qwl[h])
             vi = tf.matmul(value, self.vwl[h])
+            ki = tf.matmul(key,   self.kwl[h])
+            # scale the key values by 1/sqrt(dk) in lieu of doing it in the Attention() layer
+            ki = ki / np.sqrt(self.dk)
             # apply attention to this head
-            hi = layers.Attention()([qi,vi], lm)
+            hi = layers.Attention()([qi, vi, ki], [qmask, vmask])
             # add this head's output to the list
             hl.append(hi)
         # concatenate the individual head outputs (if necessary) along their last axis
@@ -174,7 +181,7 @@ class MultiHeadAttention(keras.layers.Layer):
 def transformer_layer(i, mask):
     # 
     # multi-head self-attention
-    sa1 = MultiHeadAttention(nheads)([i,i], [mask,mask])
+    sa1 = MultiHeadAttention(nheads)([i,i,i], [mask,mask])
     #
     # dropout
     dr1 = layers.Dropout(dropout_rate)(sa1)
@@ -214,7 +221,6 @@ rep = o2[:,0,:]
 # dense classifier
 outputs = layers.Dense(1, activation='sigmoid')(rep)
 
-
 # define the model
 model = keras.Model([inputs, mask], outputs, name="transformer")
 model.summary()
@@ -239,15 +245,16 @@ history = model.fit((x_train, tmask),
 # I guess that's because this isn't a particularly transformer-friendly task.
 
 
+
 # Embedding Scaling
 #
-# After 5 epochs of training with model_dim=64 the scale variable has changed from 0.05 to 0.019
-# Other runs with model_dim=64 have produced 0.017 and 0.021
-# After 5 epochs of training with model_dim=512 the scale variable has changed from 0.05 to 0.074
-# Other runs with model_dim=512 have produced 0.069 and 0.048
+# After 5 epochs of training with model_dim=64 the scale variable has changed from 0.05 to 0.024
+# Other runs with model_dim=64 have produced 0.024 and 0.026
+# After 5 epochs of training with model_dim=512 the scale variable has changed from 0.05 to 0.068
+# Other runs with model_dim=512 have produced 0.049 and 0.068
 # I note that :
-# 0.019 * 400 = 7.6  which is close to sqrt(64) = 8
-# 0.069 * 400 = 27.6 which is not a million miles from sqrt(512) = 22.6
+# 0.024 * 400 = 9.6  which is fairly close to sqrt(64) = 8
+# 0.068 * 400 = 27.2 which is not a million miles from sqrt(512) = 22.6
 # It is as if the scale multiplier "wants" to be sqrt(model_dim), or a reasonable approximation thereof.
 # What is going on?
 
@@ -313,129 +320,158 @@ history = model.fit((x_train, tmask),
 # obvious 1/sqrt(model_dim) to compensate for here.  In fact, given
 # their fixed initializations the matrix multiplications might even
 # contribute a further sqrt(model_dim) upscaling, reduced by their
-# 0.05 default stdev.  The individual head values are then fed to an
-# Attention layer.  However, an oversight on my part was to use the
-# standard Keras Attention layer, which, unlike the attention layer
-# used in the Transformer paper, does not apply a 1/sqrt(head_dim)
-# inverse scaling to the dot product result.  There is therefore no
-# inverse scaling to compensate for here either.  After the MultiHead-
-# Attention comes a LayerNormalization, which sets the scale to 1, so
-# the learned scale multiplier cannot be due to later components.
+# 0.05 default stdev.  Key values are then scaled by 1/sqrt(head_dim)
+# where head_dim is a fraction of model_dim.  This is the first
+# explicit inverse scaling in the model.  Could it be the case that
+# the scale multipliers are compensating for this later inverse
+# scaling?  The answer is probably not, because an earlier version of
+# my code omitted that inverse scaling due to an oversight, and still
+# produced similar scale multipliers.  After the MultiHead-Attention
+# comes a LayerNormalization, which sets the scale to 1, so the
+# learned scale multiplier cannot be due to later components.
 
 # I decided to look at the stdev of the Embedding weights after
 # training and combine that with the learned scale multiple.  In the
-# model_dim=64 case the Embedding stdev=0.070112534 while the scale
-# variable is 0.01682093.  Including the 400 multiplier from the
-# ScaleLayer this comes to 0.4717.  In the model_dim=512 case the
-# Embedding stdev=0.032082427 while the scale variable is 0.041459642,
-# which comes to 0.5321.  Now this is very interesting, because what
-# we find is that the scaled representation has pretty much the same
-# scale in both cases, about 0.5, but that the model_dim=64 case has
+# model_dim=64 case the Embedding stdev=0.07589795 while the scale
+# variable is 0.022839583.  Including the 400 multiplier from the
+# ScaleLayer this comes to 0.6934.  In the model_dim=512 case the
+# Embedding stdev=0.034520503 while the scale variable is 0.06761398,
+# which comes to 0.9336.  Now this is very interesting, because what
+# we find is that the scaled representation has a pretty similar 
+# scale in both cases, say ~0.8, but that the model_dim=64 case has
 # much larger Embedding weights than the model_dim=512 case, which is
 # compensated for by learning a smaller scale variable.  Given that
-# the scale presented to the next component in the model is the same
-# in both cases, it does not seem likely that the scale is being
-# prepared for some later sqrt(model_dim) inverse scaling.
+# the scale presented to the next component in the model is about the
+# same in both cases, it does not seem likely that the scale is being
+# prepared for some later sqrt(model_dim) inverse scaling, at least
+# not when the positional encoding is present, see below.
 
 # At this point I decided to gather more data:
 
 # Without positional encoding (pet):
 
-# Without pet, with rmsprop, model_dim 64, and with learned scale : 
+# Without pet, with rmsprop, model_dim 64, and with learned scale :
 # Epoch 1/5
-# 625/625 [=...=] - 71s 114ms/step - loss: 0.3836 - acc: 0.8232 - val_loss: 0.3972 - val_acc: 0.8446
+# 625/625 [=..=] - 74s 118ms/step - loss: 0.3679 - acc: 0.8357 - val_loss: 0.2656 - val_acc: 0.8980
 # Epoch 2/5
-# 625/625 [=...=] - 71s 114ms/step - loss: 0.2383 - acc: 0.9072 - val_loss: 0.2833 - val_acc: 0.8872
+# 625/625 [=..=] - 73s 117ms/step - loss: 0.2321 - acc: 0.9128 - val_loss: 0.2940 - val_acc: 0.8914
 # Epoch 3/5
-# 625/625 [=...=] - 71s 114ms/step - loss: 0.2051 - acc: 0.9219 - val_loss: 0.2826 - val_acc: 0.8904
+# 625/625 [=..=] - 73s 118ms/step - loss: 0.1940 - acc: 0.9290 - val_loss: 0.3070 - val_acc: 0.8900
 # Epoch 4/5
-# 625/625 [=...=] - 72s 114ms/step - loss: 0.1848 - acc: 0.9317 - val_loss: 0.2809 - val_acc: 0.8864
+# 625/625 [=..=] - 74s 118ms/step - loss: 0.1732 - acc: 0.9384 - val_loss: 0.2804 - val_acc: 0.8882
 # Epoch 5/5
-# 625/625 [=...=] - 72s 116ms/step - loss: 0.1691 - acc: 0.9403 - val_loss: 0.4416 - val_acc: 0.8638
+# 625/625 [=..=] - 74s 118ms/step - loss: 0.1593 - acc: 0.9437 - val_loss: 0.3232 - val_acc: 0.8868
 
-# In this case the scale layer weight learns to be 0.0038878953 which * 400 = 1.5552
-# This is not even close to sqrt(64); in fact the scale layer is not really being used.
-# The Embedding weight stdev in this case is 0.06638129.
+# In this case the scale layer weight learns to be 0.01698722 which * 400 = 6.7949
+# The Embedding weight stdev in this case is 0.07000576.
 
-# Without pet, with rmsprop, model_dim 64, but without scale : 
+# Interestingly, the earlier version of the code that omitted the 1/sqrt(head_dim)
+# Transformer scaling found the scale layer weight learned to be 0.0038878953 which
+# * 400 = 1.5552, which is not even close to sqrt(64).  So, in the absence of both
+# the positional encoding and the Transformer scaling the scale layer is not really
+# used.  The Embedding weight stdev in this case was 0.06638129.
+
+# Without pet, with rmsprop, model_dim 64, but without learned scale :
+
 # Epoch 1/5
-# 625/625 [=...=] - 71s 113ms/step - loss: 0.3714 - acc: 0.8346 - val_loss: 0.2787 - val_acc: 0.8886
+# 625/625 [=..=] - 73s 117ms/step - loss: 0.3692 - acc: 0.8370 - val_loss: 0.2713 - val_acc: 0.8902
 # Epoch 2/5
-# 625/625 [=...=] - 71s 113ms/step - loss: 0.2345 - acc: 0.9101 - val_loss: 0.2700 - val_acc: 0.8922
+# 625/625 [=..=] - 73s 117ms/step - loss: 0.2287 - acc: 0.9140 - val_loss: 0.2686 - val_acc: 0.8914
 # Epoch 3/5
-# 625/625 [=...=] - 71s 114ms/step - loss: 0.1996 - acc: 0.9269 - val_loss: 0.3654 - val_acc: 0.8768
+# 625/625 [=..=] - 73s 117ms/step - loss: 0.1943 - acc: 0.9278 - val_loss: 0.2994 - val_acc: 0.8832
 # Epoch 4/5
-# 625/625 [=...=] - 71s 114ms/step - loss: 0.1762 - acc: 0.9357 - val_loss: 0.3052 - val_acc: 0.8892
+# 625/625 [=..=] - 73s 118ms/step - loss: 0.1734 - acc: 0.9385 - val_loss: 0.2741 - val_acc: 0.8902
 # Epoch 5/5
-# 625/625 [=...=] - 72s 115ms/step - loss: 0.1646 - acc: 0.9420 - val_loss: 0.2995 - val_acc: 0.8880
+# 625/625 [=..=] - 74s 119ms/step - loss: 0.1615 - acc: 0.9433 - val_loss: 0.2953 - val_acc: 0.8912
+
+# Embedding weight stdev : 0.07185463
+# The earlier version of the code that omitted the 1/sqrt(head_dim) Transformer scaling
+# also learned well.
 
 # With positional encoding : 
 
 # With pet, with rmsprop, model_dim 64, and with learned scale :
+
 # Epoch 1/5
-# 625/625 [=...=] - 71s 114ms/step - loss: 0.4351 - acc: 0.7912 - val_loss: 0.3049 - val_acc: 0.8714
+# 625/625 [=..=] - 74s 118ms/step - loss: 0.3861 - acc: 0.8214 - val_loss: 0.2805 - val_acc: 0.8878
 # Epoch 2/5
-# 625/625 [=...=] - 71s 114ms/step - loss: 0.2670 - acc: 0.8918 - val_loss: 0.2681 - val_acc: 0.8940
+# 625/625 [=..=] - 73s 117ms/step - loss: 0.2284 - acc: 0.9125 - val_loss: 0.3362 - val_acc: 0.8934
 # Epoch 3/5
-# 625/625 [=...=] - 71s 114ms/step - loss: 0.2161 - acc: 0.9154 - val_loss: 0.3194 - val_acc: 0.8748
+# 625/625 [=..=] - 74s 118ms/step - loss: 0.1945 - acc: 0.9258 - val_loss: 0.2728 - val_acc: 0.8926
 # Epoch 4/5
-# 625/625 [=...=] - 72s 115ms/step - loss: 0.1843 - acc: 0.9291 - val_loss: 0.3080 - val_acc: 0.8820
+# 625/625 [=..=] - 74s 118ms/step - loss: 0.1734 - acc: 0.9370 - val_loss: 0.3153 - val_acc: 0.8920
 # Epoch 5/5
-# 625/625 [=...=] - 72s 116ms/step - loss: 0.1555 - acc: 0.9419 - val_loss: 0.2965 - val_acc: 0.8892
+# 625/625 [=..=] - 74s 119ms/step - loss: 0.1580 - acc: 0.9430 - val_loss: 0.2936 - val_acc: 0.8904
 
-# With pet, with rmsprop, model_dim 64, but without scale :
+# Scale layer weight : 0.021144018 which * 400 = 8.457607
+# Embedding weight stdev : 0.07539754
+
+# The earlier version of the code that omitted the 1/sqrt(head_dim) Transformer scaling obtained
+# scale layer weights of 0.017, 0.019 and 0.021 on different runs, corresponding to scale multipliers
+# of 6.8, 7.6 and 8.4 respectively.
+
+# With pet, with rmsprop, model_dim 64, but without learned scale :
+
 # Epoch 1/5
-# 625/625 [=...=] - 71s 113ms/step - loss: 0.6640 - acc: 0.5811 - val_loss: 0.4327 - val_acc: 0.8076
+# 625/625 [=..=] - 74s 118ms/step - loss: 0.6200 - acc: 0.6289 - val_loss: 0.3657 - val_acc: 0.8404
 # Epoch 2/5
-# 625/625 [=...=] - 71s 114ms/step - loss: 0.3988 - acc: 0.8248 - val_loss: 0.3057 - val_acc: 0.8710
+# 625/625 [=..=] - 73s 117ms/step - loss: 0.3505 - acc: 0.8514 - val_loss: 0.2969 - val_acc: 0.8736
 # Epoch 3/5
-# 625/625 [=...=] - 71s 114ms/step - loss: 0.3022 - acc: 0.8755 - val_loss: 0.3829 - val_acc: 0.8278
+# 625/625 [=..=] - 73s 117ms/step - loss: 0.2725 - acc: 0.8895 - val_loss: 0.2759 - val_acc: 0.8944
 # Epoch 4/5
-# 625/625 [=...=] - 72s 115ms/step - loss: 0.2566 - acc: 0.8986 - val_loss: 0.3524 - val_acc: 0.8534
+# 625/625 [=..=] - 74s 118ms/step - loss: 0.2376 - acc: 0.9089 - val_loss: 0.3503 - val_acc: 0.8554
 # Epoch 5/5
-# 625/625 [=...=] - 72s 115ms/step - loss: 0.2310 - acc: 0.9087 - val_loss: 0.3359 - val_acc: 0.8740
+# 625/625 [=..=] - 74s 119ms/step - loss: 0.2125 - acc: 0.9205 - val_loss: 0.2874 - val_acc: 0.8936
 
-# In this case the Embedding weights learned to be slightly larger, with a stdev of 0.08820149.
+# This version can be seen to converge more slowly.
+# In this case the Embedding weights learned to be slightly larger, with a stdev of 0.08847155.
 
-# The results are clear : without the positional encoding the use or
-# non-use of a scale layer makes no difference.  With the positional
-# encoding, the model converges much more slowly in the absence of a
-# scale layer.
+# The earlier version of the code that omitted the 1/sqrt(head_dim) Transformer scaling also converged
+# more slowly, obtaining an Embedding weight stdev of 0.08820149.
+
+
+# The results are clear : either of the positional encoding or the Transformer 1/sqrt(head_dim) scaling
+# is sufficient to cause the learned scale layer to be approximately sqrt(model_dim).  When both are
+# present the learned scale layer will still approximate sqrt(model_dim).  When the positional encoding
+# is present without a learned scale layer the model will converge more slowly, both with and without
+# 1/sqrt(head_dim) Transformer scaling.  However, without a positional encoding the model seems to
+# learn just fine without a learned scale layer both with or without a Transformer scaling.  So the
+# learned scale layer is only needed when a positional encoding is present.
+
 
 # With pet, with rmsprop, model_dim 64, and with a fixed sqrt(model_dim) scale :
 # Epoch 1/5
-# 625/625 [=...=] - 71s 114ms/step - loss: 0.4619 - acc: 0.7677 - val_loss: 0.3010 - val_acc: 0.8670
+# 625/625 [=..=] - 74s 118ms/step - loss: 0.4093 - acc: 0.7958 - val_loss: 0.2777 - val_acc: 0.8916
 # Epoch 2/5
-# 625/625 [=...=] - 71s 114ms/step - loss: 0.2676 - acc: 0.8925 - val_loss: 0.3437 - val_acc: 0.8792
+# 625/625 [=..=] - 73s 117ms/step - loss: 0.2319 - acc: 0.9095 - val_loss: 0.2661 - val_acc: 0.8900
 # Epoch 3/5
-# 625/625 [=...=] - 71s 114ms/step - loss: 0.2193 - acc: 0.9144 - val_loss: 0.2666 - val_acc: 0.8866
+# 625/625 [=..=] - 73s 118ms/step - loss: 0.1975 - acc: 0.9242 - val_loss: 0.2999 - val_acc: 0.8830
 # Epoch 4/5
-# 625/625 [=...=] - 71s 114ms/step - loss: 0.1928 - acc: 0.9261 - val_loss: 0.3197 - val_acc: 0.8880
+# 625/625 [=..=] - 74s 118ms/step - loss: 0.1725 - acc: 0.9371 - val_loss: 0.2936 - val_acc: 0.8942
 # Epoch 5/5
-# 625/625 [=...=] - 72s 115ms/step - loss: 0.1744 - acc: 0.9329 - val_loss: 0.2886 - val_acc: 0.8904
+# 625/625 [=..=] - 74s 119ms/step - loss: 0.1537 - acc: 0.9442 - val_loss: 0.3704 - val_acc: 0.8900
 
 # Comparing to the corresponding results with the learned scale above
 # we see there is no difference between learned and fixed scales.
-# (The slight advantage of the learned scale on the first epoch may
-# be illusory - natural run-to-run variations are of this order.)
+
 
 # Finally I tried training with Adam instead of RMSProp:
 
 # With pet, with Adam, model_dim 64, and with learned scale :
-# The scale layer learns to be 0.030601751 which * 400 is 12.24, which is 53% larger than sqrt(64).
-# The Embedding stdev was 0.06509646, meaning the scaled embedding had stdev 0.7968
+# The scale layer learns to be 0.041741468 which * 400 is 16.696587, which is 109% larger than sqrt(64).
+# The Embedding stdev was 0.06704463, meaning the scaled embedding had stdev 1.1194
 
 # With pet, with Adam, model_dim 512, and with learned scale :
-# The scale layer learns to be 0.13267525 which * 400 is 53.07, which is 135% larger than sqrt(512).
-# The Embedding stdev was 0.040197168, meaning the scaled embedding had stdev 2.1333
+# The scale layer learns to be 0.045255862 which * 400 is 18.102345, close to sqrt(512).
+# The Embedding stdev was 0.049073763, meaning the scaled embedding had stdev 0.8884
 
-# With Adam the learned scale multiple is somewhat larger than sqrt(model_dim).
+# With Adam the learned scale multiples may be different.
 # However, it must be noted that Adam reaches lower training losses, and higher accuracies, than RMSProp.
 # Rerunning the model_dim 64 experiment and stopping after 3 epochs, when training loss is comparable
-# to that of RMSProp at 5 epochs, yields an even larger scale layer of 0.034979478, which * 400 is 13.99.
+# to that of RMSProp at 5 epochs, yields an even larger scale layer of 0.04297345, which * 400 is 17.18938
 
 # It appears that the Embedding weight stdev is strongly determined by model_dim.
-# 64 dim models typically have weight stdev of about 0.07, and 512 dim models of about 0.03-4
+# 64 dim models typically have weight stdev of about 0.07, and 512 dim models of 0.03-5
 # I've tried to figure out why this happens using backprop formulae but I haven't convinced myself yet.
 
 
@@ -452,5 +488,6 @@ history = model.fit((x_train, tmask),
 # Not scaling hurts model convergence.  In experiments learned scale
 # multiples are often close to sqrt(model_dim), and learned scale
 # multiples and fixed scale multiples of this size perform similarly.
-# The exact size of learned scale multiples may be optimizer dependent.
+# The exact size of learned scale multiples may be optimizer
+# dependent.
 
